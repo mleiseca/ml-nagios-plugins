@@ -1,3 +1,4 @@
+#!/usr/bin/ruby
 
 # Nagios developer guidelines
 # http://nagiosplug.sourceforge.net/developer-guidelines.html
@@ -38,8 +39,14 @@ def print_exit(status, message, perf_data)
   exit $CODE[status]
 end
 
+def v(message)
+  if $options[:verbose]
+    puts message
+  end
+end
+
 optparse = OptionParser.new do|opts|
-  # opts.banner = "Usage: check_mysqld.rb  ..."
+  # opts.banner = "Usage: check_mysql_stat_delta  ..."
   
   
   # This displays the help screen, all programs are
@@ -50,6 +57,10 @@ optparse = OptionParser.new do|opts|
   
   opts.on( '-h', '--help', 'Print this detailed help screen' ) do
     print_exit(:unknown, opts, nil)
+  end
+  
+  opts.on( '-v', '--verbose', 'Print extra debugging information' ) do
+    $options[:verbose] = true
   end
   
   # -V version (--version)
@@ -81,7 +92,7 @@ optparse = OptionParser.new do|opts|
   end
   
   $options[:log_filename] = nil
-  opts.on( '-l', '--log_filename LOG_FILENAME', 'Log filename (will default to /tmp/check_mysqld_{STATUS_VARIABLE}_{HOST}.log)' ) do|log_filename|
+  opts.on( '-l', '--log_filename LOG_FILENAME', 'Log filename (will default to /tmp/check_mysql_stat_delta_{STATUS_VARIABLE}_{HOST}.log)' ) do|log_filename|
     $options[:log_filename] = log_filename
   end
   
@@ -94,7 +105,7 @@ print_exit(:unknown, "User is required", nil) if ($options[:user].nil? || $optio
 print_exit(:unknown, "Status variable is required", nil) if $options[:status_variable].nil?
 
 if $options[:log_filename].nil?
-  $options[:log_filename] = "/tmp/check_mysqld_" << $options[:status_variable] << "_" << $options[:host] <<  ".log"
+  $options[:log_filename] = "/tmp/check_mysql_stat_delta_" << $options[:status_variable] << "_" << $options[:host] <<  ".log"
 end
 
 # pp "Options:", $options
@@ -118,12 +129,14 @@ begin
       previous_value = vals[1]
     end
   end
-rescue => err
-  # todo: what if user just doesn't have read access to file?
+rescue Errno::EACCES => err 
+  # user doesn't have read access to file
+  print_exit(:critical, "Error reading " + $options[:log_filename] + ": " + err.to_s, nil)
+rescue Errno::ENOENT => err
   # file didn't exist
 end
 
-# puts "Previous time: #{previous_time}, previous value: #{previous_value}"
+v("Previous time: #{previous_time}, previous value: #{previous_value}")
 
 ################################
 #
@@ -131,12 +144,6 @@ end
 #
 ################################
 
-
-# print "MYSQL " << "OK status variable: " << $options[:status_variable];
-# print " " << 
-
-
-# todo: on connection error
 begin 
   con = Mysql.new($options[:host],$options[:user], $options[:password])  
 rescue Mysql::Error => err
@@ -144,7 +151,7 @@ rescue Mysql::Error => err
 end
 rs = con.query('show status')  
 
-current_time = Time.now.getutc.to_i
+current_time = sprintf('%.3f',Time.now.getutc.to_f)
 current_value = nil
 rs.each do |row|
   col1 = row[0]
@@ -153,24 +160,35 @@ rs.each do |row|
     current_value = col2
   end
 end
-# rs.each_hash { |h| puts h['name']}  
 con.close
 
 if current_value.nil?
-  # todo: error: couldn't find status variable
+  print_exit(:unknown, "Unable to find status variable '" +$options[:status_variable] + "'", nil)
 end
 
-# todo: error writing
-File.open($options[:log_filename], 'w') {|f| f.write([current_time,current_value].join("\t")) }
+begin 
+  File.open($options[:log_filename], 'w') {|f| f.write([sprintf('%.3f',current_time),current_value].join("\t")) }
+rescue Errno::EACCES => err 
+  # user doesn't have write access to file
+  print_exit(:critical, "Error writing " + $options[:log_filename] + ": " + err.to_s, nil)
+end
 
-
-# todo: what to do on boot strapping??
 diff_value = current_value.to_i - previous_value.to_i
-diff_time = current_time.to_i - previous_time.to_i
+diff_time = current_time.to_f - previous_time.to_f
 
-# puts "#{diff_value} / #{diff_time} = " << sprintf('%.3f',diff_value.fdiv( diff_time))
+if previous_value.nil? 
+  # first time running this check. No previous file found
+  v("No previous value found")
+  print_exit(:ok, "unknown per second. No previous value found.", $options[:status_variable] << "" )
+elsif diff_value < 0 
+  # server must have restarted
+  v("#{diff_value} is negative. Server must have restared")
+  print_exit(:ok, "unknown per second. Previous value was greater than current value", $options[:status_variable] << "" )
+else
+  val_per_second = sprintf('%.3f',diff_value.fdiv( diff_time))
+  v("#{diff_value} / #{diff_time} = " << sprintf('%.3f',diff_value.fdiv( diff_time)))
+  print_exit(:ok, "#{val_per_second} per second", $options[:status_variable] << "=#{val_per_second}" )
+end
 
-val_per_second = sprintf('%.3f',diff_value.fdiv( diff_time))
-print_exit(:ok, "#{val_per_second} per second", $options[:status_variable] << "=#{val_per_second}" )
 
 
