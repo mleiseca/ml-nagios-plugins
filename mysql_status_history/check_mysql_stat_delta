@@ -15,9 +15,7 @@ $VERSION = "check_mysql_stat_delta version: 0.1"
 # Innodb_rows_read 2031268891
 # Innodb_rows_updated 25667
 
-#todo: add a timeout:DEFAULT_SOCKET_TIMEOUT
 
-# todo: threshold/range support
 $CODE={
   :ok=>0,
   :warning=>1,
@@ -29,11 +27,51 @@ $CODE={
 
 $options = {}
 
+
+# from http://pastebin.com/RAZkxhY2
+# returns true if value is within range
+# 10       < 0 or > 10, (outside the range of {0 .. 10})
+# 10:      < 10, (outside {10 .. infinity})
+# ~:10     > 10, (outside the range of {-infinity .. 10})
+# 10:20   < 10 or > 20, (outside the range of {10 .. 20})
+# @10:20  >= 10 and <= 20, (inside the range of {10 .. 20})
+def range_match ( value, range )
+  
+  v("checking for #{value} in #{range}")
+  return false if ! value or ! range
+  
+  value = value.to_f
+  return (value < 0 || value > range) if range.class != String
+
+  result = false
+  negate = (range =~ /^@(.*)/)
+  range  = $1 if negate
+  if range =~ /^(\d+)$/
+    result = (value < 0 || value > $1.to_i)
+    # untested from here to the end of the function
+  elsif range =~ /^(\d+):[~]?$/
+    result = (value < $1.to_i)
+  elsif range =~ /^~:(\d+)$/
+    result = (value > $1.to_i)
+  elsif range =~ /^(\d+):(\d+)$/
+    result = (value > $1.to_i && value < $2.to_i)
+  end
+ return negate ? !result : result
+end
+
 def print_exit(status, message, perf_data)
-  variable_description = $options[:status_variable] ? $options[:status_variable] : ""
+  
+  if range_match(perf_data, $options[:critical])
+    status = :critical
+  elsif range_match(perf_data, $options[:warning])
+    status = :warning    
+  end
+
+  variable_description = $options[:status_variable] ? $options[:status_variable] : ""  
+  
   print "MYSQL STAT " << variable_description << "-" << status.to_s.upcase
   print ". " << message.to_s
-  print " |" << (perf_data ? perf_data.to_s : ""); 
+  print " |" << (perf_data ? $options[:status_variable] + "=#{perf_data}"  : ""); 
   print "\n";
   
   exit $CODE[status]
@@ -59,18 +97,27 @@ optparse = OptionParser.new do|opts|
     print_exit(:unknown, opts, nil)
   end
   
+  $options[:verbose] = false
   opts.on( '-v', '--verbose', 'Print extra debugging information' ) do
     $options[:verbose] = true
   end
   
-  # -V version (--version)
-  # -h help (--help)
-  # -t timeout (--timeout)
-  #  -w warning threshold (--warning)
-  #  -c critical threshold (--critical)
-  #  -H hostname (--hostname)
-  #  -v verbose (--verbose)
-  #  
+  # todo: use DEFAULT_SOCKET_TIMEOUT as default
+  $options[:timeout] = 10
+  opts.on( '-t', '--timeout SECONDS', 'check execution timeout' ) do|timeout|
+    $options[:timeout] = timeout
+  end
+   
+  $options[:warning] = nil
+  opts.on( '-w', '--warning Warning', 'Threshold to issue a warning' ) do|warning|
+    $options[:warning] = warning
+  end
+  
+  $options[:critical] = nil
+  opts.on( '-c', '--critical Critical_Threshold', 'Threshold to issue a warning' ) do|critical|
+    $options[:critical] = critical
+  end
+   
   $options[:host] = 'localhost'
   opts.on( '-H', '--host HOST', 'Host to connect to. Default is localhost' ) do|host|
     $options[:host] = host
@@ -111,19 +158,19 @@ end
 # pp "Options:", $options
 # pp "ARGV:", ARGV
 
-################################
+################################################################################################
 #
 # read previously saved data.
 # Format: time\tvalue
 #
-################################
+################################################################################################
 
 previous_time = nil
 previous_value = nil
 begin
   File.open($options[:log_filename], "r") do |infile|
     while (line = infile.gets)
-      # todo: malformed file
+      # todo: malformed file ?
       vals = line.split(/\t/)
       previous_time = vals[0]
       previous_value = vals[1]
@@ -138,11 +185,11 @@ end
 
 v("Previous time: #{previous_time}, previous value: #{previous_value}")
 
-################################
+################################################################################################
 #
 # read show status from mysql.
 #
-################################
+################################################################################################
 
 begin 
   con = Mysql.new($options[:host],$options[:user], $options[:password])  
@@ -166,6 +213,12 @@ if current_value.nil?
   print_exit(:unknown, "Unable to find status variable '" +$options[:status_variable] + "'", nil)
 end
 
+################################################################################################
+#
+# write the new value to the log file
+#
+################################################################################################
+
 begin 
   File.open($options[:log_filename], 'w') {|f| f.write([sprintf('%.3f',current_time),current_value].join("\t")) }
 rescue Errno::EACCES => err 
@@ -173,21 +226,29 @@ rescue Errno::EACCES => err
   print_exit(:critical, "Error writing " + $options[:log_filename] + ": " + err.to_s, nil)
 end
 
+################################################################################################
+#
+# calculate occurrences per second for reporting
+# If we are running the check for the first time, return OK status without a per second figure
+#
+################################################################################################
+
+
 diff_value = current_value.to_i - previous_value.to_i
 diff_time = current_time.to_f - previous_time.to_f
 
 if previous_value.nil? 
   # first time running this check. No previous file found
   v("No previous value found")
-  print_exit(:ok, "unknown per second. No previous value found.", $options[:status_variable] << "" )
+  print_exit(:ok, "unknown per second. No previous value found.", nil)
 elsif diff_value < 0 
   # server must have restarted
   v("#{diff_value} is negative. Server must have restared")
-  print_exit(:ok, "unknown per second. Previous value was greater than current value", $options[:status_variable] << "" )
+  print_exit(:ok, "unknown per second. Previous value was greater than current value", nil)
 else
   val_per_second = sprintf('%.3f',diff_value.fdiv( diff_time))
   v("#{diff_value} / #{diff_time} = " << sprintf('%.3f',diff_value.fdiv( diff_time)))
-  print_exit(:ok, "#{val_per_second} per second", $options[:status_variable] << "=#{val_per_second}" )
+  print_exit(:ok, "#{val_per_second} per second", val_per_second )
 end
 
 
