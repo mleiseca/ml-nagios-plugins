@@ -13,7 +13,16 @@
 #  - Innodb_rows_updated 
 ################################################################################################
 
+# Service type: check_mysql_stat_delta
+#   output:MYSQL STAT DELTA Queries-OK. 0.114 per second
+#   perfdata:Queries=0.114
+# /output:MYSQL STAT DELTA Queries\D*?(\d+[.\d]*)/
+# and push @s, [ mysql_stat,
+#                 [ 'queries_per_second', GAUGE, $1 ]];
 
+# set up a new service with a mysql status variable
+# nagiosgraph.conf maximums should include this new service name
+# serviceextinfo.cfg should include information about this service so that you get a graph
 
 require 'mysql' 
 require 'optparse'
@@ -78,7 +87,7 @@ def print_exit(status, message, perf_data)
 
   variable_description = $options[:status_variable] ? $options[:status_variable] : ""  
   
-  print "MYSQL STAT " << variable_description << "-" << status.to_s.upcase
+  print "MYSQL STAT DELTA " << variable_description << "-" << status.to_s.upcase
   print ". " << message.to_s
   print " |" << (perf_data ? $options[:status_variable] + "=#{perf_data}"  : ""); 
   print "\n";
