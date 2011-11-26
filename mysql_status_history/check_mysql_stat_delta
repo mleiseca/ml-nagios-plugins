@@ -3,17 +3,26 @@
 # Nagios developer guidelines
 # http://nagiosplug.sourceforge.net/developer-guidelines.html
 
+
+################################################################################################
+# Especially nice for tracking status_variables like:
+#  - Queries
+#  - Innodb_rows_deleted 
+#  - Innodb_rows_inserted 
+#  - Innodb_rows_read 
+#  - Innodb_rows_updated 
+################################################################################################
+
+
+
 require 'mysql' 
 require 'optparse'
 require 'pp'
+require 'timeout'
+
 
 $VERSION = "check_mysql_stat_delta version: 0.1"
 
-# Queries
-# Innodb_rows_deleted 196558
-# Innodb_rows_inserted 4672974
-# Innodb_rows_read 2031268891
-# Innodb_rows_updated 25667
 
 
 $CODE={
@@ -191,23 +200,29 @@ v("Previous time: #{previous_time}, previous value: #{previous_value}")
 #
 ################################################################################################
 
-begin 
-  con = Mysql.new($options[:host],$options[:user], $options[:password])  
+current_time = nil
+current_value = nil
+begin
+  db = Mysql.init
+  db.options(Mysql::OPT_CONNECT_TIMEOUT, $options[:timeout].to_i)
+  db.options(Mysql::OPT_READ_TIMEOUT,    $options[:timeout].to_i)
+  db.real_connect($options[:host],$options[:user], $options[:password] )
+  
+  rs = db.query('show status')  
+
+  current_time = sprintf('%.3f',Time.now.getutc.to_f)
+  current_value = nil
+  rs.each do |row|
+    col1 = row[0]
+    col2 = row[1]
+    if col1 == $options[:status_variable]
+      current_value = col2
+    end
+  end
+  db.close
 rescue Mysql::Error => err
   print_exit(:critical, "Error connecting to mysql: " << err.to_s, nil)
 end
-rs = con.query('show status')  
-
-current_time = sprintf('%.3f',Time.now.getutc.to_f)
-current_value = nil
-rs.each do |row|
-  col1 = row[0]
-  col2 = row[1]
-  if col1 == $options[:status_variable]
-    current_value = col2
-  end
-end
-con.close
 
 if current_value.nil?
   print_exit(:unknown, "Unable to find status variable '" +$options[:status_variable] + "'", nil)
