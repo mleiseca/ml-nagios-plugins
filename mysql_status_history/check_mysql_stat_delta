@@ -54,7 +54,6 @@ $options = {}
 # 10:20   < 10 or > 20, (outside the range of {10 .. 20})
 # @10:20  >= 10 and <= 20, (inside the range of {10 .. 20})
 def range_match ( value, range )
-  
   v("checking for #{value} in #{range}")
   return false if ! value or ! range
   
@@ -79,17 +78,26 @@ end
 
 def print_exit(status, message, perf_data)
   
-  if range_match(perf_data, $options[:critical])
-    status = :critical
-  elsif range_match(perf_data, $options[:warning])
-    status = :warning    
+  if perf_data
+    perf_data.each do |variable, value|
+      index = $options[:status_variable].index(variable)
+      critical = $options[:critical][index] if $options[:critical]
+      warning  = $options[:warning][index] if $options[:warning]
+          
+      if range_match(value, critical)
+        status = :critical
+      elsif range_match(value, warning)
+        if status != :critical
+          status = :warning    
+        end
+      end
+    end
   end
 
-  variable_description = $options[:status_variable] ? $options[:status_variable] : ""  
+  variable_description = $options[:status_variable] ? $options[:status_variable].join(",") : ""  
   
-  print "MYSQL STAT DELTA " << variable_description << "-" << status.to_s.upcase
-  print ". " << message.to_s
-  print " |" << (perf_data ? $options[:status_variable] + "=#{perf_data}"  : ""); 
+  print "MYSQL STAT DELTA #{variable_description} - #{status.to_s.upcase}. #{message}" 
+  print " |" << (perf_data ? perf_data.collect{|key,value| "#{key}=#{value}"}.join(",")  : ""); 
   print "\n";
   
   exit $CODE[status]
@@ -128,12 +136,12 @@ optparse = OptionParser.new do|opts|
    
   $options[:warning] = nil
   opts.on( '-w', '--warning Warning', 'Threshold to issue a warning' ) do|warning|
-    $options[:warning] = warning
+    $options[:warning] = warning.split(",")
   end
   
   $options[:critical] = nil
   opts.on( '-c', '--critical Critical_Threshold', 'Threshold to issue a warning' ) do|critical|
-    $options[:critical] = critical
+    $options[:critical] = critical.split(",")
   end
    
   $options[:host] = 'localhost'
@@ -151,9 +159,9 @@ optparse = OptionParser.new do|opts|
     $options[:password] = password
   end
   
-  $options[:status_variable] = nil
+  $options[:status_variable] = []
   opts.on( '-s', '--status_variable STATUS_VARIABLE', 'Status variable to monitor' ) do|status_variable|
-    $options[:status_variable] = status_variable
+    $options[:status_variable] = status_variable.split(",")
   end
   
   $options[:log_filename] = nil
@@ -167,14 +175,24 @@ optparse.parse!
 
 print_exit(:unknown, "Host is required", nil) if ($options[:host].nil? || $options[:host] == "")
 print_exit(:unknown, "User is required", nil) if ($options[:user].nil? || $options[:user] == "")
-print_exit(:unknown, "Status variable is required", nil) if $options[:status_variable].nil?
+print_exit(:unknown, "Status variable is required", nil) if ($options[:status_variable].nil? || $options[:status_variable].empty?)
+
+if ($options[:warning] && ($options[:status_variable].length != $options[:warning].length))
+  print_exit(:unknown, "Warning arg count doesn't match status variable count", nil) 
+end
+
+if ($options[:critical] && ($options[:status_variable].length != $options[:critical].length))
+  print_exit(:unknown, "Critical arg count doesn't match status variable count.", nil) 
+end
 
 if $options[:log_filename].nil?
-  $options[:log_filename] = "/tmp/check_mysql_stat_delta_" << $options[:status_variable] << "_" << $options[:host] <<  ".log"
+  $options[:log_filename] = "/tmp/check_mysql_stat_delta_" << $options[:status_variable].join("-") << "_" << $options[:host] <<  ".log"
 end
 
 # pp "Options:", $options
 # pp "ARGV:", ARGV
+
+v("Using status variables: #{$options[:status_variable]}")
 
 ################################################################################################
 #
@@ -184,14 +202,19 @@ end
 ################################################################################################
 
 previous_time = nil
-previous_value = nil
+previous_values = {}
 begin
   File.open($options[:log_filename], "r") do |infile|
     while (line = infile.gets)
       # todo: malformed file ?
+      line.chomp!
       vals = line.split(/\t/)
       previous_time = vals[0]
-      previous_value = vals[1]
+      
+      for index in 1...vals.length
+        value_for_variable = vals[index].split(":")
+        previous_values[value_for_variable[0]] = value_for_variable[1]
+      end
     end
   end
 rescue Errno::EACCES => err 
@@ -201,7 +224,7 @@ rescue Errno::ENOENT => err
   # file didn't exist
 end
 
-v("Previous time: #{previous_time}, previous value: #{previous_value}")
+v("Previous time: #{previous_time}, previous value: #{previous_values}" )
 
 ################################################################################################
 #
@@ -210,7 +233,7 @@ v("Previous time: #{previous_time}, previous value: #{previous_value}")
 ################################################################################################
 
 current_time = nil
-current_value = nil
+current_values = {}
 begin
   db = Mysql.init
   db.options(Mysql::OPT_CONNECT_TIMEOUT, $options[:timeout].to_i)
@@ -224,8 +247,9 @@ begin
   rs.each do |row|
     col1 = row[0]
     col2 = row[1]
-    if col1 == $options[:status_variable]
-      current_value = col2
+    index = $options[:status_variable].index(col1)
+    if index and index >= 0
+      current_values[col1] = col2
     end
   end
   db.close
@@ -233,8 +257,12 @@ rescue Mysql::Error => err
   print_exit(:critical, "Error connecting to mysql: " << err.to_s, nil)
 end
 
-if current_value.nil?
-  print_exit(:unknown, "Unable to find status variable '" +$options[:status_variable] + "'", nil)
+v("Found values: #{current_values}" )
+
+$options[:status_variable].each do |var|
+  if ! current_values[var] 
+    print_exit(:unknown, "Unable to find status variable '#{var}'", nil)
+  end
 end
 
 ################################################################################################
@@ -244,10 +272,13 @@ end
 ################################################################################################
 
 begin 
-  File.open($options[:log_filename], 'w') {|f| f.write([sprintf('%.3f',current_time),current_value].join("\t")) }
+  File.open($options[:log_filename], 'w') { |f| 
+    values_string = current_values.collect{|key,value| "#{key}:#{value}"}.join("\t")
+    f.write([sprintf('%.3f',current_time),values_string].join("\t"))
+  }
 rescue Errno::EACCES => err 
   # user doesn't have write access to file
-  print_exit(:critical, "Error writing " + $options[:log_filename] + ": " + err.to_s, nil)
+  print_exit(:critical, "Error writing #{$options[:log_filename]}: " + err.to_s, nil)
 end
 
 ################################################################################################
@@ -258,22 +289,27 @@ end
 ################################################################################################
 
 
-diff_value = current_value.to_i - previous_value.to_i
+perf_data = {}
 diff_time = current_time.to_f - previous_time.to_f
+current_values.each do |variable, value|
+  diff_value = value.to_i - previous_values[variable].to_i
 
-if previous_value.nil? 
-  # first time running this check. No previous file found
-  v("No previous value found")
-  print_exit(:ok, "unknown per second. No previous value found.", nil)
-elsif diff_value < 0 
-  # server must have restarted
-  v("#{diff_value} is negative. Server must have restared")
-  print_exit(:ok, "unknown per second. Previous value was greater than current value", nil)
-else
-  val_per_second = sprintf('%.3f',diff_value.fdiv( diff_time))
-  v("#{diff_value} / #{diff_time} = " << sprintf('%.3f',diff_value.fdiv( diff_time)))
-  print_exit(:ok, "#{val_per_second} per second", val_per_second )
+  if previous_values[variable].nil? 
+    # first time running this check. No previous file found
+    v("No previous value found")
+    print_exit(:ok, "unknown per second. No previous value found for variable #{variable}", nil)
+  elsif diff_value < 0 
+    # server must have restarted
+    v("#{diff_value} is negative. Server must have restared")
+    print_exit(:ok, "unknown per second. Previous value was greater than current value", nil)
+  else
+    val_per_second = sprintf('%.3f',diff_value.fdiv( diff_time))
+    v("#{diff_value} / #{diff_time} = " << sprintf('%.3f',diff_value.fdiv( diff_time)))
+    
+    perf_data[variable] = val_per_second
+  end
 end
 
+print_exit(:ok, "", perf_data )
 
 
